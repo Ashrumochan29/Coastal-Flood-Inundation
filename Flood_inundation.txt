@@ -1,0 +1,95 @@
+// Define the Area of Interest (AOI)
+var aoi = ee.Geometry.Polygon([
+  [[85.5, 20.5], [86.5, 20.5], [86.5, 19.5], [85.5, 19.5], [85.5, 20.5]]
+]);
+
+// Define pre- and post-flood dates
+var preFloodDate = ee.Date('2023-07-01');
+var postFloodDate = ee.Date('2023-07-10');
+
+// Load Sentinel-1 SAR Data (VV & VH polarizations)
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
+
+// Select pre-flood and post-flood images
+var preFlood = sentinel1.filterDate(preFloodDate.advance(-10, 'day'), preFloodDate)
+  .median()
+  .select(['VV', 'VH']);
+var postFlood = sentinel1.filterDate(postFloodDate, postFloodDate.advance(10, 'day'))
+  .median()
+  .select(['VV', 'VH']);
+
+// **Apply Speckle Noise Reduction using the Refined Lee Filter**
+function speckleFilter(img) {
+  return img.focalMean(50, 'circle', 'meters');
+}
+
+var preFloodFiltered = speckleFilter(preFlood);
+var postFloodFiltered = speckleFilter(postFlood);
+
+// **Compute Flood Difference using VV & VH**
+var vvDiff = postFloodFiltered.select('VV').subtract(preFloodFiltered.select('VV'));
+var vhDiff = postFloodFiltered.select('VH').subtract(preFloodFiltered.select('VH'));
+
+// **Combine VV and VH Differences into a Multi-Band Image**
+var floodDifference = vvDiff.addBands(vhDiff);
+
+// **Train CART Classifier using Pre- and Post-Flood Data**
+var water = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([86.0, 20.0]), {'class': 1}), // Flooded Water
+  ee.Feature(ee.Geometry.Point([85.8, 19.8]), {'class': 1})
+]);
+
+var nonWater = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([85.6, 19.6]), {'class': 0}), // Non-Flooded Land
+  ee.Feature(ee.Geometry.Point([86.2, 19.9]), {'class': 0})
+]);
+
+var trainingData = water.merge(nonWater);
+
+// **Extract Features for Training**
+var training = floodDifference.sampleRegions({
+  collection: trainingData,
+  properties: ['class'],
+  scale: 30
+});
+
+// **Train the Classification and Regression Tree (CART) Model**
+var classifier = ee.Classifier.smileCart().train({
+  features: training,
+  classProperty: 'class'
+});
+
+// **Apply the Trained Classifier to Generate Flood Map**
+var floodExtent = floodDifference.classify(classifier);
+
+// **Apply Smoothing for Better Accuracy**
+var smoothedFloodExtent = floodExtent.focalMode(3); // Mode filter for noise reduction
+
+// **Define Visualization Parameters**
+var visParams = {
+  min: 0,
+  max: 1,
+  palette: ['blue', 'red'] // Blue for Water (Flooded), Red for Land (Non-Flooded)
+};
+
+// **Add Layers to the Map for Visualization**
+Map.centerObject(aoi, 8);
+Map.addLayer(preFloodFiltered.select('VV'), {min: -25, max: 5, palette: ['white', 'black']}, 'Pre-Flood VV');
+Map.addLayer(preFloodFiltered.select('VH'), {min: -25, max: 5, palette: ['white', 'black']}, 'Pre-Flood VH');
+Map.addLayer(postFloodFiltered.select('VV'), {min: -25, max: 5, palette: ['white', 'black']}, 'Post-Flood VV');
+Map.addLayer(postFloodFiltered.select('VH'), {min: -25, max: 5, palette: ['white', 'black']}, 'Post-Flood VH');
+Map.addLayer(smoothedFloodExtent, visParams, 'Flood Extent (Smoothed)');
+
+// **Export Flood Extent Map**
+Export.image.toDrive({
+  image: smoothedFloodExtent,
+  description: 'FloodExtentMap_VV_VH_Smoothed',
+  scale: 30,
+  region: aoi,
+  fileFormat: 'GeoTIFF'
+});
